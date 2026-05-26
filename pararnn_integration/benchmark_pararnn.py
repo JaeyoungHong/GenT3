@@ -169,13 +169,13 @@ if __name__ == '__main__':
         run(B0, T, D0, K0, K0, f"T={T:5d}")
 
     section("Vary D  (T=512, H=W=8, B=4)")
-    for D in [8, 16, 32, 64]:
+    for D in [8, 16, 32, 64, 128, 256]:
         run(B0, T0, D, K0, K0, f"D={D:5d}")
 
     section("Vary H=W  (T=512, D=32, B=4)")
-    for K in [4, 8, 16]:
+    for K in [4, 8, 16, 24, 32]:
         run(B0, T0, D0, K, K, f"H=W={K:3d}")
 
     section("Vary B  (T=512, D=32, H=W=8)")
-    for B in [1, 4, 16]:
+    for B in [1, 4, 16, 32, 64, 128]:
         run(B, T0, D0, K0, K0, f"B={B:5d}")
