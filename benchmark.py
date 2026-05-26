@@ -91,12 +91,19 @@ def make_lift_unlift(sH, sW, rH, rW, PhiH, PsiH, PhiW, PsiW):
     return lift, unlift
 
 
-# ── Timing utility ────────────────────────────────────────────────────────────
+# ── Timing + memory utility ───────────────────────────────────────────────────
 
-def timed(fn, warmup=3, iters=10):
+def measure(fn, warmup=3, iters=10):
+    """Run fn and return (avg_ms, peak_extra_MB).
+
+    peak_extra_MB is the peak GPU memory allocated above the pre-call baseline,
+    so it isolates each method's working-set cost from setup tensors.
+    """
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
+    base = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
     e0 = torch.cuda.Event(enable_timing=True)
     e1 = torch.cuda.Event(enable_timing=True)
     e0.record()
@@ -104,12 +111,16 @@ def timed(fn, warmup=3, iters=10):
         fn()
     e1.record()
     torch.cuda.synchronize()
-    return e0.elapsed_time(e1) / iters   # ms
+    ms = e0.elapsed_time(e1) / iters
+    peak = torch.cuda.max_memory_allocated()
+    return ms, (peak - base) / (1024 ** 2)
 
 
 # ── Main benchmark ────────────────────────────────────────────────────────────
 
-def run(B=4, T=256, D=32, H=8, W=8):
+def run(B=4, T=256, D=32, H=8, W=8, label=None):
+    if label is None:
+        label = f"T={T:5d}"
     # Channel-diagonal MM-Conv: a=0.7, b=c=0.15, d=0 (stable: |0.7|+2*0.15=1.0, borderline)
     # Use a=0.6 to stay safely inside |Lambda|<1
     block = MMConv(D, D, H, W).to(DEVICE).eval()
@@ -141,10 +152,12 @@ def run(B=4, T=256, D=32, H=8, W=8):
 
     # ── Method 2: sequential spectral MM-Conv ─────────────────────────────────
     def seq_mmconv():
+        # Hoisted DST: one batched lift over all T inputs, then loop is just elementwise.
+        Z = lift(inp_hwc.reshape(T * B, H, W, D)).reshape(T, B, D, H, W)
         h = lift(h0_hwc)   # (B, D, H, W) spectral
         out = []
         for t in range(T):
-            h = Lam * h + lift(inp_hwc[t])
+            h = Lam * h + Z[t]
             out.append(h)
         # batch-unlift at end
         stacked = torch.stack(out)                              # (T, B, D, H, W)
@@ -162,19 +175,19 @@ def run(B=4, T=256, D=32, H=8, W=8):
         ys = seq_mmconv()   # (T, B, H, W, D)
         yp = par_mmconv()   # (T, B, H, W, D)
 
-    err_s = (ys.permute(0,1,4,2,3) - yc).abs().max().item()
     err_p = (yp.permute(0,1,4,2,3) - yc).abs().max().item()
+    del yc, ys, yp
+    torch.cuda.empty_cache()
 
-    ms1 = timed(seq_conv2d)
-    ms2 = timed(seq_mmconv)
-    ms3 = timed(par_mmconv)
+    ms1, m1 = measure(seq_conv2d)
+    ms2, m2 = measure(seq_mmconv)
+    ms3, m3 = measure(par_mmconv)
 
-    print(f"T={T:5d}  "
-          f"seq_conv2d={ms1:7.2f}ms  "
-          f"seq_mmconv={ms2:7.2f}ms  "
-          f"par_scan={ms3:7.2f}ms  "
-          f"speedup={ms1/ms3:5.2f}x  "
-          f"err_s={err_s:.1e}  err_p={err_p:.1e}")
+    print(f"{label}  "
+          f"conv2d={ms1:7.2f}ms /{m1:6.0f}MB  "
+          f"seq_mm={ms2:7.2f}ms /{m2:6.0f}MB  "
+          f"par_mm={ms3:7.2f}ms /{m3:6.0f}MB  "
+          f"spd={ms1/ms3:5.2f}x  err={err_p:.1e}")
 
 
 # ── Full dense: matrix recurrence scan ───────────────────────────────────────
@@ -237,7 +250,7 @@ def par_matrix_scan(Lam_hw, Z_flat, h0_flat):
     return B[src]
 
 
-def run_dense(B=4, T=256, D=32, H=8, W=8):
+def run_dense(B=4, T=256, D=32, H=8, W=8, label=None):
     """
     Full dense MM-Conv (all D×D channel pairs active) with uniform alpha=1.
 
@@ -246,15 +259,20 @@ def run_dense(B=4, T=256, D=32, H=8, W=8):
     evolves under the D×D matrix Lambda[k_h,k_w], enabling a matrix
     recurrence parallel scan via batched matmul.
     """
+    if label is None:
+        label = f"T={T:5d}"
     block = MMConv(D, D, H, W).to(DEVICE).eval()
+    torch.manual_seed(0)
     with torch.no_grad():
         block.log_alpha_H.data.zero_()    # alpha = exp(0) = 1 (uniform)
         block.log_alpha_W.data.zero_()
-        # Dense D×D channel-mixing matrix, stable via small norm
+        # Scale random part by 1/sqrt(D) so spectral norm stays bounded as D grows.
+        # Without this, |Lambda| ~ 1 + sqrt(D)*sigma  →  T=512 powers overflow float32.
+        s = (D ** -0.5)
         block.a.data = torch.eye(D, device=DEVICE) * 0.5 \
-                     + torch.randn(D, D, device=DEVICE) * 0.02
-        block.b.data = torch.randn(D, D, device=DEVICE) * 0.05
-        block.c.data = torch.randn(D, D, device=DEVICE) * 0.05
+                     + torch.randn(D, D, device=DEVICE) * (0.05 * s)
+        block.b.data = torch.randn(D, D, device=DEVICE) * (0.05 * s)
+        block.c.data = torch.randn(D, D, device=DEVICE) * (0.05 * s)
         block.d.data.zero_()
 
     with torch.no_grad():
@@ -266,6 +284,14 @@ def run_dense(B=4, T=256, D=32, H=8, W=8):
         # Reshape Lambda for matrix scan: (HW, D, D), must be contiguous so
         # par_matrix_scan's reshape(n_el,D,D) returns a view, not a copy
         Lam_hw = Lambda.permute(2, 3, 0, 1).reshape(H * W, D, D).contiguous()
+        # Stacked 1×1-conv weights for the seq_mmconv loop (detached from autograd).
+        W_stack = torch.stack([block.a, block.b, block.c, block.d]).reshape(4 * D, D, 1, 1)
+        scale = torch.stack([
+            torch.ones(H, W, device=DEVICE),
+            block.xi_H.unsqueeze(-1).expand(H, W),
+            block.xi_W.unsqueeze(0).expand(H, W),
+            block.xi_H.unsqueeze(-1) * block.xi_W.unsqueeze(0),
+        ]).view(1, 4, 1, H, W)
 
     # ── Lift / unlift for uniform alpha=1 (shared DST, no per-(q,r) twist) ──
     # X (..., H, W, D_in) → Z (..., D_in, H, W)
@@ -292,14 +318,19 @@ def run_dense(B=4, T=256, D=32, H=8, W=8):
         return torch.stack(out)   # (T, B, D, H, W)
 
     # ── Sequential dense MM-Conv spectral ─────────────────────────────────────
+    # Lambda factors separably:  Lam = a + b·ξ_H + c·ξ_W + d·ξ_H·ξ_W .
+    # So the spectral step  h_new[q,k,l] = Σ_r Lam[q,r,k,l] · h[r,k,l]  becomes a
+    # single (4D, D, 1, 1) cuDNN 1×1 conv followed by a per-pixel weighted fold of
+    # its four channel blocks — strictly faster than einsum/bmm at these sizes.
+    # (W_stack and scale are precomputed inside the no_grad block above.)
     def seq_mmconv():
+        # Hoisted DST: one batched lift over all T inputs, loop is recurrence only.
+        Z = lift(inp_hwc.reshape(T * B, H, W, D)).reshape(T, B, D, H, W)
         h = lift(h0_hwc)   # (B, D, H, W) spectral
         out = []
         for t in range(T):
-            # Spectral recurrence: h[q,k,l] = sum_r Lambda[q,r,k,l]*h[r,k,l] + z[q,k,l]
-            # With uniform alpha, the spectral state is indexed only by r (input channel).
-            # The mixing: h_new[q] = sum_r Lambda[q,r,k,l]*h[r] is a D×D matmul per mode.
-            h = torch.einsum('qrkl,brkl->bqkl', Lambda, h) + lift(inp_hwc[t])
+            y = F.conv2d(h, W_stack).view(B, 4, D, H, W) * scale  # (B, 4, D, H, W)
+            h = y.sum(dim=1) + Z[t]
             out.append(h)
         stacked = torch.stack(out)   # (T, B, D, H, W)
         return unlift_raw(stacked.reshape(T * B, D, H, W)).reshape(T, B, H, W, D)
@@ -326,32 +357,71 @@ def run_dense(B=4, T=256, D=32, H=8, W=8):
         ys = seq_mmconv()
         yp = par_mmconv()
 
-    err_s = (ys.permute(0,1,4,2,3) - yc).abs().max().item()
     err_p = (yp.permute(0,1,4,2,3) - yc).abs().max().item()
+    del yc, ys, yp
+    torch.cuda.empty_cache()
 
-    ms1 = timed(seq_conv2d)
-    ms2 = timed(seq_mmconv)
-    ms3 = timed(par_mmconv)
+    ms1, m1 = measure(seq_conv2d)
+    ms2, m2 = measure(seq_mmconv)
+    ms3, m3 = measure(par_mmconv)
 
-    print(f"T={T:5d}  "
-          f"seq_conv2d={ms1:7.2f}ms  "
-          f"seq_mmconv={ms2:7.2f}ms  "
-          f"par_scan={ms3:7.2f}ms  "
-          f"speedup={ms1/ms3:5.2f}x  "
-          f"err_s={err_s:.1e}  err_p={err_p:.1e}")
+    print(f"{label}  "
+          f"conv2d={ms1:7.2f}ms /{m1:6.0f}MB  "
+          f"seq_mm={ms2:7.2f}ms /{m2:6.0f}MB  "
+          f"par_mm={ms3:7.2f}ms /{m3:6.0f}MB  "
+          f"spd={ms1/ms3:5.2f}x  err={err_p:.1e}")
+
+
+def section(title):
+    print("\n" + "═" * 110)
+    print(title)
+    print("═" * 110)
+
+
+def subsection(title):
+    print(f"\n── {title} ──")
 
 
 if __name__ == '__main__':
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    print(f"\n── Diagonal (channel-independent, depthwise) ──")
-    print(f"{'T':>7}  {'seq_conv2d':>14}  {'seq_mmconv':>14}  {'par_scan':>12}  {'speedup':>9}  errors")
-    print("─" * 85)
-    for T in [32, 64, 128, 256, 512, 1024, 2048]:
-        run(B=4, T=T, D=32, H=8, W=8)
+    # Defaults for fixed dims when sweeping another
+    T0, D0, K0, B0 = 512, 32, 8, 4
 
-    print(f"\n── Full dense (D×D channel mixing, uniform alpha) ──")
-    print(f"{'T':>7}  {'seq_conv2d':>14}  {'seq_mmconv':>14}  {'par_scan':>12}  {'speedup':>9}  errors")
-    print("─" * 85)
-    for T in [32, 64, 128, 256, 512, 1024, 2048]:
-        run_dense(B=4, T=T, D=32, H=8, W=8)
+    # ── Diagonal ────────────────────────────────────────────────────────────
+    section("DIAGONAL (channel-independent depthwise, parallel scalar scan)")
+
+    subsection(f"vary T  (D={D0}, H=W={K0}, B={B0})")
+    for T in [32, 128, 512, 2048]:
+        run(B=B0, T=T, D=D0, H=K0, W=K0, label=f"T={T:5d}")
+
+    subsection(f"vary D  (T={T0}, H=W={K0}, B={B0})")
+    for D in [8, 16, 32, 64, 128]:
+        run(B=B0, T=T0, D=D, H=K0, W=K0, label=f"D={D:5d}")
+
+    subsection(f"vary H=W  (T={T0}, D={D0}, B={B0})")
+    for K in [4, 8, 16, 32]:
+        run(B=B0, T=T0, D=D0, H=K, W=K, label=f"H=W={K:3d}")
+
+    subsection(f"vary B  (T={T0}, D={D0}, H=W={K0})")
+    for B in [1, 4, 16, 64]:
+        run(B=B, T=T0, D=D0, H=K0, W=K0, label=f"B={B:5d}")
+
+    # ── Dense ──────────────────────────────────────────────────────────────
+    section("DENSE (D×D channel mixing, uniform alpha, parallel matrix scan)")
+
+    subsection(f"vary T  (D={D0}, H=W={K0}, B={B0})")
+    for T in [32, 128, 512, 2048]:
+        run_dense(B=B0, T=T, D=D0, H=K0, W=K0, label=f"T={T:5d}")
+
+    subsection(f"vary D  (T={T0}, H=W={K0}, B={B0})")
+    for D in [8, 16, 32, 64]:
+        run_dense(B=B0, T=T0, D=D, H=K0, W=K0, label=f"D={D:5d}")
+
+    subsection(f"vary H=W  (T={T0}, D={D0}, B={B0})")
+    for K in [4, 8, 16, 32]:
+        run_dense(B=B0, T=T0, D=D0, H=K, W=K, label=f"H=W={K:3d}")
+
+    subsection(f"vary B  (T={T0}, D={D0}, H=W={K0})")
+    for B in [1, 4, 16, 64]:
+        run_dense(B=B, T=T0, D=D0, H=K0, W=K0, label=f"B={B:5d}")
