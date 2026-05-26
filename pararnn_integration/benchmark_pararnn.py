@@ -21,16 +21,17 @@ from pararnn_integration import SpectralMMConvGRU
 # ── Baseline: standard ConvGRU ─────────────────────────────────────────────
 
 class ConvGRU(nn.Module):
-    """Sequential ConvGRU. State mixing = full 3×3 conv per gate."""
+    """Sequential ConvGRU. State mixing = full 3×3 conv per gate (dense channel mixing)."""
 
-    def __init__(self, D, H, W, device='cuda', dtype=torch.float32):
+    def __init__(self, D, H, W, device='cuda', dtype=torch.float32, depthwise=False):
         super().__init__()
         self.D, self.H, self.W = D, H, W
-        # State mixing: 3×3 conv per gate (z, r, h)
-        self.U_z = nn.Conv2d(D, D, 3, padding=1, bias=False, device=device, dtype=dtype)
-        self.U_r = nn.Conv2d(D, D, 3, padding=1, bias=False, device=device, dtype=dtype)
-        self.U_h = nn.Conv2d(D, D, 3, padding=1, bias=False, device=device, dtype=dtype)
-        # Input projection: 1×1 conv per gate
+        # State mixing: 3×3 conv per gate; depthwise (groups=D) when fair-comparison mode.
+        groups = D if depthwise else 1
+        self.U_z = nn.Conv2d(D, D, 3, padding=1, groups=groups, bias=False, device=device, dtype=dtype)
+        self.U_r = nn.Conv2d(D, D, 3, padding=1, groups=groups, bias=False, device=device, dtype=dtype)
+        self.U_h = nn.Conv2d(D, D, 3, padding=1, groups=groups, bias=False, device=device, dtype=dtype)
+        # Input projection: 1×1 conv per gate (full channel mixing per spatial position).
         self.W_z = nn.Conv2d(D, D, 1, bias=True, device=device, dtype=dtype)
         self.W_r = nn.Conv2d(D, D, 1, bias=True, device=device, dtype=dtype)
         self.W_h = nn.Conv2d(D, D, 1, bias=True, device=device, dtype=dtype)
@@ -109,38 +110,35 @@ def run(B, T, D, H, W, label):
     def make_x():
         return torch.randn(B, T, H, W, D, device=device, requires_grad=True)
 
-    # Baseline: sequential ConvGRU
+    # Baseline 1: dense ConvGRU (full 3×3 channel-mixing state conv) — expressive but unfair
     torch.manual_seed(0)
-    convgru = ConvGRU(D, H, W, device=device)
+    convgru_dense = ConvGRU(D, H, W, device=device, depthwise=False)
     x = make_x()
-    fwd_c, bwd_c, mem_c = measure(convgru, x)
-    total_c = fwd_c + bwd_c
-    del convgru, x
-    torch.cuda.empty_cache()
+    fwd_d, bwd_d, mem_d = measure(convgru_dense, x)
+    total_d = fwd_d + bwd_d
+    del convgru_dense, x; torch.cuda.empty_cache()
 
-    # SpectralMMConvGRU — parallel (PyTorch Newton + scan)
+    # Baseline 2: depthwise ConvGRU (channel-diagonal state, same structure as ours)
     torch.manual_seed(0)
-    par_model = SpectralMMConvGRU(D=D, H=H, W=W, mode='parallel', device=device)
+    convgru_dw = ConvGRU(D, H, W, device=device, depthwise=True)
     x = make_x()
-    fwd_p, bwd_p, mem_p = measure(par_model, x)
-    total_p = fwd_p + bwd_p
-    del par_model, x
-    torch.cuda.empty_cache()
+    fwd_dw, bwd_dw, mem_dw = measure(convgru_dw, x)
+    total_dw = fwd_dw + bwd_dw
+    del convgru_dw, x; torch.cuda.empty_cache()
 
-    # SpectralMMConvGRU — parallel_CUDA (custom kernel)
+    # SpectralMMConvGRU — parallel_CUDA (the fastest path)
     torch.manual_seed(0)
     cuda_model = SpectralMMConvGRU(D=D, H=H, W=W, mode='parallel_CUDA', device=device)
     x = make_x()
     fwd_pc, bwd_pc, mem_pc = measure(cuda_model, x)
     total_pc = fwd_pc + bwd_pc
-    del cuda_model, x
-    torch.cuda.empty_cache()
+    del cuda_model, x; torch.cuda.empty_cache()
 
     print(f"{label}  "
-          f"convgru={total_c:7.1f}ms /{mem_c:6.0f}MB  "
-          f"par_py={total_p:7.1f}ms /{mem_p:6.0f}MB  "
-          f"par_cuda={total_pc:7.1f}ms /{mem_pc:6.0f}MB  "
-          f"spd_py={total_c/total_p:5.2f}x  spd_cuda={total_c/total_pc:5.2f}x")
+          f"dense={total_d:6.1f}ms/{mem_d:5.0f}MB  "
+          f"depthwise={total_dw:6.1f}ms/{mem_dw:5.0f}MB  "
+          f"par_cuda={total_pc:6.1f}ms/{mem_pc:5.0f}MB  "
+          f"vs_dense={total_d/total_pc:5.2f}x  vs_depthw={total_dw/total_pc:5.2f}x")
 
 
 # ── Sweeps ─────────────────────────────────────────────────────────────────
@@ -158,9 +156,10 @@ def subsection(title):
 if __name__ == '__main__':
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print("\nMethods compared (forward + backward time / peak memory above baseline):")
-    print("  convgru   : standard ConvGRU, 3×3 conv per gate, T-step sequential loop")
-    print("  par_py    : SpectralMMConvGRU, ParaRNN 'parallel' mode (Newton + scan, PyTorch)")
-    print("  par_cuda  : SpectralMMConvGRU, ParaRNN 'parallel_CUDA' mode (custom CUDA kernel)")
+    print("  dense     : Sequential ConvGRU with full 3×3 channel-mixing state conv (D² per tap)")
+    print("  depthwise : Sequential ConvGRU with 3×3 DEPTHWISE state conv (9·D state-mix params)")
+    print("              — same channel-diagonal structure as our framework, fair comparison")
+    print("  par_cuda  : SpectralMMConvGRU in 'parallel_CUDA' mode (Newton + custom diag scan)")
 
     T0, D0, K0, B0 = 512, 32, 8, 4
 
