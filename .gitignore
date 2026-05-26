@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Virtual envs / build dirs
+.venv/
+venv/
+env/
+
+# Locally-installed CUDA toolchain (see README for setup)
+.cuda_nvcc/
+
+# Editor / tooling
+.claude/
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store

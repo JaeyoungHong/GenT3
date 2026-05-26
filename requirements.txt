@@ -1,0 +1,12 @@
+# Core MM-Conv (mmconv.py, test_mmconv.py, benchmark.py) only needs PyTorch.
+torch>=2.0
+
+# The `pararnn_integration/` subpackage additionally requires Apple's ParaRNN.
+# Not pinnable from PyPI — install from source. See pararnn_integration/README.md
+# for the CUDA build flags needed on a CUDA 12.x toolchain.
+#
+#   pip install git+https://github.com/apple/ml-pararnn@main \
+#       --no-build-isolation
+#
+# If you don't need parallel-along-T training (just the spectral / scan code
+# in benchmark.py and mmconv.py), you can skip this entirely.
