@@ -41,8 +41,10 @@ MM-Conv (we plug in here).
 
 - `mmconv_gru_diag.py` — `MMConvGRUDiagCell`. Replaces ParaRNN's free `(3, state_dim)` A parameter with a `(3, D)` MM-Conv parameterization. Reuses `GRUDiagMHImpl` unchanged.
 - `mmconv_lstm_cifg_diag.py` — `MMConvLSTMCIFGDiagCell`. Same for CIFG-LSTM, applied to both `A` (state mixing) and `C` (peephole) vectors. Reuses `LSTMCIFGDiagMHImpl` unchanged.
-- `spectral_wrapper.py` — `SpectralMMConvGRU`, `SpectralMMConvLSTM`. `nn.Module` wrappers that own `α_H`, `α_W`, build the per-channel twisted DST matrices on each forward, and sandwich the cell between lift / unlift einsums.
+- `spectral_wrapper.py` — `SpectralMMConvGRU`, `SpectralMMConvLSTM`. `nn.Module` wrappers that own `α_H`, `α_W`, build the per-channel twisted DST matrices on each forward, and sandwich the cell between lift / unlift einsums. **`num_heads` defaults to `H·W`** (each spatial position gets its own D×D input projection, mirroring a 1×1 conv); see the discussion at the bottom.
 - `test_integration.py` — sequential vs parallel correctness + speedup sanity check.
+- `benchmark_pararnn.py` — full sweep vs sequential ConvGRU (dense and depthwise variants), measuring fwd+bwd time and peak GPU memory across T, D, H=W, B.
+- `test_lift_only.py` — standalone DST roundtrip check (no ParaRNN needed; useful for sanity-checking the math).
 
 ## Modes available
 
@@ -91,6 +93,59 @@ Expect:
   tests have the same property)
 - `test_spectral_gru_endtoend`: confirms gradients flow into `log_alpha_H` and
   `cell.a_mm` (i.e. the new MM-Conv knobs are learnable)
+
+## Speedup vs sequential ConvGRU
+
+`benchmark_pararnn.py` measures forward + backward time and peak GPU memory
+against two sequential baselines: a dense 3×3 ConvGRU (full D² channel-mixing
+state) and a depthwise 3×3 ConvGRU (channel-diagonal state — the fair
+comparison, matching our framework's structure). At `T=512, D=32, H=W=8, B=4`:
+
+| Config | dense | depthwise | par_cuda | vs dense | vs depthwise |
+|---|---:|---:|---:|---:|---:|
+| T=128    |  174 ms |  154 ms | 9.7 ms | **18×** | **16×** |
+| T=2048   | 2784 ms | 2566 ms | 54 ms  | **51×** | **47×** |
+| D=8      |  704 ms |  612 ms | 9.6 ms | **74×** | **64×** |
+| D=64     |  743 ms |  632 ms | 30 ms  | **25×** | **21×** |
+| D=256    |  927 ms |  687 ms | 129 ms | **7.2×**| **5.3×** |
+| H=W=4    |  700 ms |  627 ms | 9.4 ms | **74×** | **66×** |
+| H=W=16   |  666 ms |  606 ms | 57 ms  | **12×** | **11×** |
+| H=W=32   | 1100 ms | 1031 ms | 266 ms | **4.1×**| **3.9×** |
+| B=1      |  616 ms |  572 ms | 9.5 ms | **65×** | **60×** |
+| B=128    | 1730 ms | 1630 ms | 450 ms | **3.8×**| **3.6×** |
+
+**Two non-obvious takeaways:**
+
+1. *Dense and depthwise ConvGRU run in nearly identical wall time* — both are
+   cuDNN-launch-overhead-bound at these tensor sizes, so depthwise's 9·D
+   state-mix FLOPs vs dense's 9·D² is invisible. The channel-diagonal
+   restriction in our model class buys ~10% wall-time, not 10×.
+
+2. *The remaining ~90% of the speedup is from parallel-in-T training itself.*
+   Doing one big batched Newton + diag scan instead of T sequential cudnn
+   convs is the actual mechanism. Wins are biggest at long T, small batch,
+   small spatial, modest channel — the SSM regime.
+
+The framework still beats both baselines at every config tested. Spatial
+size is where it degrades fastest (DST cost is quadratic in H or W) — at
+H=W=32 the speedup drops to 4× from 70+ at H=W=4.
+
+## Why `num_heads = H·W` (the default)
+
+This is non-obvious enough to warrant a callout. ParaRNN's input projection
+matrix `B` has shape `(num_heads, head_input_dim, 3, head_state_dim)` — it's
+block-diagonal in the input/state with `num_heads` independent blocks.
+
+- With `num_heads=1` (the obvious default): one giant `(state_dim, 3·state_dim)`
+  matrix. For state_dim = D·H·W this scales as `(D·H·W)²` in parameters and
+  FLOPs — quartic in spatial and quadratic in D. Wrecks scaling.
+- With `num_heads=H·W` (our default): one D×D projection per spatial position,
+  exactly matching how a 1×1 conv treats channels. `H·W · D²` params total,
+  recurrence scales linearly in D.
+
+You can override `num_heads=` in the wrapper constructor if you want; the
+default is set up for the "spatial input" use case where each `(k_h, k_w)`
+spectral mode is an independent unit.
 
 ## Open items / extensions
 

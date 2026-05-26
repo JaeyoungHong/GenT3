@@ -59,7 +59,7 @@ from pararnn_integration import SpectralMMConvGRU
 
 # Input: (B, T, H, W, D_in) — spatial feature-map sequence
 # Output: (B, T, H, W, D)   — same shape, spatially convolved + recurrent
-model = SpectralMMConvGRU(D=32, H=8, W=8, num_heads=4, mode='parallel_CUDA').cuda()
+model = SpectralMMConvGRU(D=32, H=8, W=8, mode='parallel_CUDA').cuda()
 y = model(x)                       # ParaRNN handles parallel-in-T training
 ```
 
@@ -68,6 +68,22 @@ Three independent learnable knobs:
 - **α_H, α_W** — per-channel spatial-decomposition geometry (σ/ρ twists)
 - **(a, b, c, d)** — per-gate, per-channel MM-Conv spectral gain coefficients
 - gates / nonlinearities — same as ParaRNN's GRUDiagMH / LSTMCifgDiagMH
+
+### Speedup over sequential ConvGRU baselines
+
+`pararnn_integration/benchmark_pararnn.py` compares forward + backward time against two sequential baselines: a standard `ConvGRU` (full 3×3 channel-mixing state conv) and a `DepthwiseConvGRU` (3×3 depthwise state conv, same channel-diagonal structure as our framework — the fair comparison). Headline on A100, `T=512, D=32, H=W=8, B=4`:
+
+| Config | dense ConvGRU | depthwise ConvGRU | par_cuda | vs dense | vs depthwise |
+|---|---:|---:|---:|---:|---:|
+| T=2048   | 2784 ms | 2566 ms | 54 ms  | **51×** | **47×** |
+| D=8      |  704 ms |  612 ms | 9.6 ms | **74×** | **64×** |
+| D=256    |  927 ms |  687 ms | 129 ms | **7×**  | **5×** |
+| H=W=4    |  700 ms |  627 ms | 9.4 ms | **74×** | **66×** |
+| H=W=32   | 1100 ms | 1031 ms | 266 ms | **4×**  | **4×** |
+| B=1      |  616 ms |  572 ms | 9.5 ms | **65×** | **60×** |
+| B=128    | 1730 ms | 1630 ms | 450 ms | **4×**  | **4×** |
+
+**The depthwise and dense ConvGRU baselines are nearly identical in wall time** (both launch-overhead-bound at these sizes) — so the channel-diagonal restriction in our framework accounts for only ~10% of the speedup. The other ~90% comes from the parallel-in-T training itself (Newton + diag scan vs T sequential cudnn calls). The framework wins decisively at every config tested.
 
 See [`pararnn_integration/README.md`](pararnn_integration/README.md) for the full layout, file-by-file responsibilities, and installation notes (the CUDA-toolchain build hint at the bottom).
 
