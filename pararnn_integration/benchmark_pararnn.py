@@ -120,7 +120,7 @@ def run(B, T, D, H, W, label):
 
     # SpectralMMConvGRU — parallel (PyTorch Newton + scan)
     torch.manual_seed(0)
-    par_model = SpectralMMConvGRU(D=D, H=H, W=W, num_heads=1, mode='parallel', device=device)
+    par_model = SpectralMMConvGRU(D=D, H=H, W=W, mode='parallel', device=device)
     x = make_x()
     fwd_p, bwd_p, mem_p = measure(par_model, x)
     total_p = fwd_p + bwd_p
@@ -129,7 +129,7 @@ def run(B, T, D, H, W, label):
 
     # SpectralMMConvGRU — parallel_CUDA (custom kernel)
     torch.manual_seed(0)
-    cuda_model = SpectralMMConvGRU(D=D, H=H, W=W, num_heads=1, mode='parallel_CUDA', device=device)
+    cuda_model = SpectralMMConvGRU(D=D, H=H, W=W, mode='parallel_CUDA', device=device)
     x = make_x()
     fwd_pc, bwd_pc, mem_pc = measure(cuda_model, x)
     total_pc = fwd_pc + bwd_pc

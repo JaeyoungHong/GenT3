@@ -95,12 +95,19 @@ class _SpectralMMConvBase(nn.Module):
 
 
 class SpectralMMConvGRU(_SpectralMMConvBase):
-    """Spectral MM-Conv GRU. Lift → ParaRNN MMConvGRUDiag cell → unlift."""
+    """Spectral MM-Conv GRU. Lift → ParaRNN MMConvGRUDiag cell → unlift.
+
+    `num_heads` defaults to H·W: one D×D input projection per spatial position,
+    which mirrors how a 1×1 conv treats channels. With num_heads=1 you instead
+    get a fully-connected (D·H·W)² input projection — quadratic in state-dim,
+    which kills scaling and wastes memory. Don't do that unless you have a
+    reason.
+    """
 
     def __init__(
             self,
             D: int, H: int, W: int,
-            num_heads: int = 1,
+            num_heads: int = None,
             nonlin_update: str = 'sigmoid',
             nonlin_reset: str = 'sigmoid',
             nonlin_state: str = 'tanh',
@@ -112,6 +119,8 @@ class SpectralMMConvGRU(_SpectralMMConvBase):
     ):
         super().__init__(D, H, W, device, dtype, alpha_H_init, alpha_W_init)
         state_dim = D * H * W
+        if num_heads is None:
+            num_heads = H * W
         # input_dim equals state_dim here: input is spectrally-lifted with same D
         # channels per spatial position. To accept a different D_in, add an extra
         # 1×1 channel projection before the lift.
@@ -130,12 +139,17 @@ class SpectralMMConvGRU(_SpectralMMConvBase):
 
 
 class SpectralMMConvLSTM(_SpectralMMConvBase):
-    """Spectral MM-Conv CIFG-LSTM. Lift → ParaRNN MMConvLSTMCIFGDiag cell → unlift."""
+    """Spectral MM-Conv CIFG-LSTM. Lift → ParaRNN MMConvLSTMCIFGDiag cell → unlift.
+
+    See `SpectralMMConvGRU` for the `num_heads` discussion — default H·W gives
+    per-spatial-position D×D input projections (analogous to a 1×1 conv) and
+    linear-in-D scaling. num_heads=1 wastes memory and ruins scaling.
+    """
 
     def __init__(
             self,
             D: int, H: int, W: int,
-            num_heads: int = 1,
+            num_heads: int = None,
             nonlin_f: str = 'sigmoid',
             nonlin_o: str = 'sigmoid',
             nonlin_c: str = 'tanh',
@@ -148,6 +162,8 @@ class SpectralMMConvLSTM(_SpectralMMConvBase):
     ):
         super().__init__(D, H, W, device, dtype, alpha_H_init, alpha_W_init)
         state_dim = D * H * W
+        if num_heads is None:
+            num_heads = H * W
         config = MMConvLSTMCIFGDiagConfig(
             state_dim=state_dim,
             input_dim=state_dim,
